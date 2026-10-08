@@ -1,7 +1,5 @@
 name: Maintenance regression checks
 on:
-  push:
-    branches: [maintenance/reliable-device-control]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -17,6 +15,9 @@ jobs:
           distribution: temurin
           java-version: '21'
       - uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+          log-accepted-android-sdk-licenses: false
       - name: Install SDK
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
       - name: Build and run targeted regression tests
