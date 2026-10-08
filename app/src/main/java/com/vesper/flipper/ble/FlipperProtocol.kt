@@ -350,14 +350,14 @@ class FlipperProtocol @Inject constructor() {
         operation = "list directory",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while listing directory: $path") }
     ) {
-        sendRpcListDirectoryLocked(path) ?: sendLegacyListDirectoryLocked(path)
+        sendRpcListDirectoryLocked(path) ?: legacyTransportFallback { sendLegacyListDirectoryLocked(path) }
     }
 
     suspend fun readFile(path: String): ProtocolResponse = withCommandLock(
         operation = "read file",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while reading file: $path") }
     ) {
-        when (val response = sendRpcReadFileLocked(path) ?: sendLegacyReadFileLocked(path)) {
+        when (val response = sendRpcReadFileLocked(path) ?: legacyTransportFallback { sendLegacyReadFileLocked(path) }) {
             is ProtocolResponse.BinaryContent -> {
                 ProtocolResponse.FileContent(response.data.toString(Charsets.UTF_8))
             }
@@ -369,49 +369,56 @@ class FlipperProtocol @Inject constructor() {
         operation = "read file binary",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while reading binary file: $path") }
     ) {
-        sendRpcReadFileLocked(path) ?: sendLegacyReadFileLocked(path)
+        sendRpcReadFileLocked(path) ?: legacyTransportFallback { sendLegacyReadFileLocked(path) }
     }
 
     suspend fun writeFile(path: String, content: ByteArray): ProtocolResponse = withCommandLock(
         operation = "write file",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while writing file: $path") }
     ) {
-        sendRpcWriteFileLocked(path, content) ?: sendLegacyWriteFileLocked(path, content)
+        sendRpcWriteFileLocked(path, content) ?: legacyTransportFallback { sendLegacyWriteFileLocked(path, content) }
     }
 
     suspend fun createDirectory(path: String): ProtocolResponse = withCommandLock(
         operation = "create directory",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while creating directory: $path") }
     ) {
-        sendRpcCreateDirectoryLocked(path) ?: sendLegacyCreateDirectoryLocked(path)
+        sendRpcCreateDirectoryLocked(path) ?: legacyTransportFallback { sendLegacyCreateDirectoryLocked(path) }
     }
 
     suspend fun delete(path: String, recursive: Boolean = false): ProtocolResponse = withCommandLock(
         operation = "delete path",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while deleting: $path") }
     ) {
-        sendRpcDeleteLocked(path, recursive) ?: sendLegacyDeleteLocked(path, recursive)
+        sendRpcDeleteLocked(path, recursive) ?: legacyTransportFallback { sendLegacyDeleteLocked(path, recursive) }
     }
 
     suspend fun move(sourcePath: String, destPath: String): ProtocolResponse = withCommandLock(
         operation = "move path",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while moving: $sourcePath -> $destPath") }
     ) {
-        sendRpcMoveLocked(sourcePath, destPath) ?: sendLegacyMoveLocked(sourcePath, destPath)
+        sendRpcMoveLocked(sourcePath, destPath) ?: legacyTransportFallback { sendLegacyMoveLocked(sourcePath, destPath) }
     }
 
     suspend fun getDeviceInfo(): ProtocolResponse = withCommandLock(
         operation = "get device info",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while requesting device info") }
     ) {
-        sendRpcDeviceInfoLocked() ?: sendLegacyDeviceInfoLocked()
+        sendRpcDeviceInfoLocked() ?: legacyTransportFallback { sendLegacyDeviceInfoLocked() }
     }
 
     suspend fun getStorageInfo(): ProtocolResponse = withCommandLock(
         operation = "get storage info",
         onTimeout = { ProtocolResponse.Error("Command pipeline busy while requesting storage info") }
     ) {
-        sendRpcStorageInfoLocked() ?: sendLegacyStorageInfoLocked()
+        sendRpcStorageInfoLocked() ?: legacyTransportFallback { sendLegacyStorageInfoLocked() }
+    }
+
+    private suspend fun legacyTransportFallback(block: suspend () -> ProtocolResponse): ProtocolResponse {
+        if (bleService?.usesBleCommandTransport() == true) {
+            return ProtocolResponse.Error("Bluetooth RPC did not respond. Unlock the Flipper and reconnect; no text CLI commands were sent to Bluetooth.")
+        }
+        return block()
     }
 
     private suspend fun sendLegacyListDirectoryLocked(path: String): ProtocolResponse {
@@ -939,7 +946,11 @@ class FlipperProtocol @Inject constructor() {
                 firmwareVersion = firmwareVersion,
                 hardwareVersion = hardwareVersion,
                 batteryLevel = batteryLevel.coerceIn(0, 100),
-                isCharging = isCharging
+                isCharging = isCharging,
+                firmwareTarget = deviceInfoPairs["firmware_target"]?.let { "f" + it.removePrefix("f") },
+                firmwareApi = deviceInfoPairs["firmware_api_major"]?.let { major ->
+                    deviceInfoPairs["firmware_api_minor"]?.let { minor -> "$major.$minor" }
+                }
             ),
             storageInfo = storageInfo
         )
@@ -1222,18 +1233,9 @@ class FlipperProtocol @Inject constructor() {
         onTimeout: () -> T,
         block: suspend () -> T
     ): T {
-        val result = withTimeoutOrNull(timeoutMs) {
-            commandMutex.withLock {
-                block()
-            }
-        }
-        if (result != null) {
-            return result
-        }
-        if (operation.isNotBlank()) {
-            // Keep operation name in scope for easier timeout diagnostics.
-        }
-        return onTimeout()
+        // Limit the wait for the mutex, not the RPC operation holding it.
+        // Storage transfers have their own size-dependent response deadlines.
+        return commandMutex.withAcquisitionTimeout(timeoutMs, onTimeout, block)
     }
 
     private fun isRawCollectorActive(): Boolean {
@@ -1411,6 +1413,9 @@ class FlipperProtocol @Inject constructor() {
      */
     suspend fun sendCliCommand(command: String): ProtocolResponse {
         val normalizedCommand = normalizeCliCommand(command)
+        if (bleService?.usesBleCommandTransport() == true) {
+            return executeRpcAppCommand(normalizedCommand)
+        }
         val commandVariants = buildCliCommandVariants(normalizedCommand)
 
         var lastResponse: ProtocolResponse = ProtocolResponse.Error("No response")
@@ -1671,6 +1676,7 @@ class FlipperProtocol @Inject constructor() {
                 markCliUnavailable("Flipper command transport is not connected")
                 return@withCommandLock false
             }
+            if (service.usesBleCommandTransport()) return@withCommandLock false
             val data = "$text\r\n".toByteArray(Charsets.UTF_8)
             val sent = service.sendData(data)
             if (!sent) {
@@ -1710,6 +1716,11 @@ class FlipperProtocol @Inject constructor() {
             return@withCommandLock current
         }
 
+        // The Flipper BLE Serial service consumes protobuf RPC, not a text console.
+        if (service.usesBleCommandTransport()) {
+            return@withCommandLock probeRpcTransportAvailability()
+                ?: markCliUnavailable("Bluetooth RPC did not respond. Unlock Flipper and reconnect.")
+        }
         val response = probeRawCliOutput()
 
         return@withCommandLock if (response.isNotBlank()) {
@@ -1796,6 +1807,10 @@ class FlipperProtocol @Inject constructor() {
 
     private suspend fun recoverCliFromRpcSessionLocked(): CliCapabilityStatus {
         val service = bleService ?: return markCliUnavailable("Device service unavailable")
+        if (service.usesBleCommandTransport()) {
+            return probeRpcTransportAvailability()
+                ?: markCliUnavailable("Bluetooth RPC did not respond. Unlock Flipper and reconnect.")
+        }
         if (!ensureTransportConnected(service)) {
             return markCliUnavailable("Flipper command transport is not connected")
         }
@@ -3145,6 +3160,7 @@ class FlipperProtocol @Inject constructor() {
     }
 
     private suspend fun collectRawCliResponse(commandText: String, timeoutMs: Long): String {
+        if (bleService?.usesBleCommandTransport() == true) return ""
         val attempts = buildList {
             add(commandText)
             val lf = commandText
@@ -3342,6 +3358,7 @@ class FlipperProtocol @Inject constructor() {
 
     private suspend fun tryStartRpcSession(): Boolean {
         val service = bleService ?: return false
+        if (service.usesBleCommandTransport()) return false
         val sessionCommands = listOf(
             "start_rpc_session\r",
             "start_rpc_session\r\n",

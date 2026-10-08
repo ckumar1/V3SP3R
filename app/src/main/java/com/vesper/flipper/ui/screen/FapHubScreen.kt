@@ -43,6 +43,7 @@ fun FapHubScreen(
     val displayedApps by viewModel.displayedApps.collectAsState()
     val installStatus by viewModel.installStatus.collectAsState()
     val installedApps by viewModel.installedApps.collectAsState()
+    val inventoryLoaded by viewModel.inventoryLoaded.collectAsState()
     val categoryCounts by viewModel.categoryCounts.collectAsState()
     val isLoading by viewModel.isLoading.collectAsState()
     val error by viewModel.error.collectAsState()
@@ -77,7 +78,7 @@ fun FapHubScreen(
                             Text("ARSENAL", modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp), style = MaterialTheme.typography.labelSmall, color = VesperOrange, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                         }
                     }
-                    Text("Flipper App Hub and resource libraries • ${installedApps.size} installed", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(if (inventoryLoaded) "${installedApps.size} app files found on Flipper" else "Installed apps not checked — connect and refresh", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                 }
                 IconButton(onClick = { viewModel.refresh() }) {
                     Icon(Icons.Default.Refresh, contentDescription = "Refresh", tint = VesperOrange)
@@ -250,6 +251,7 @@ private fun ResourcesTabContent(
     onRepoClick: (FlipperResourceRepo) -> Unit
 ) {
     Column {
+        Text("Browse sources here. In Chat, ask to download a specific raw file to its Flipper folder (for example, an IR remote to /ext/infrared).", modifier = Modifier.padding(16.dp), style = MaterialTheme.typography.bodySmall, color = Color.Gray)
         OutlinedTextField(
             value = searchQuery, onValueChange = onSearchChange,
             modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),

@@ -142,6 +142,10 @@ class OpenRouterClient @Inject constructor(
 
             when (result) {
                 is ChatCompletionResult.Success -> {
+                    if (result.toolCalls.orEmpty().any { it.name != "execute_command" }) {
+                        lastError = ChatCompletionResult.Error("Model requested an unsupported tool. Select another tool-capable model and start a new chat.")
+                        continue
+                    }
                     toolUnsupportedModels.remove(candidateModel)
                     return@withContext result
                 }
