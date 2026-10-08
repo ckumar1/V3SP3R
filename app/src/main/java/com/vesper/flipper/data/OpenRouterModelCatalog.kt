@@ -55,6 +55,8 @@ class OpenRouterModelCatalog @Inject constructor() {
                 val remoteModels = data.mapNotNull { element ->
                     val modelObj = element.jsonObject
                     val id = modelObj.string("id") ?: return@mapNotNull null
+                    if (modelObj["supported_parameters"]?.jsonArray?.none { it.jsonPrimitive.content == "tools" } != false) return@mapNotNull null
+                    if (modelObj["architecture"]?.jsonObject?.get("output_modalities")?.jsonArray?.none { it.jsonPrimitive.content == "text" } != false) return@mapNotNull null
                     RemoteModel(
                         id = id,
                         name = modelObj.string("name") ?: id.substringAfter("/"),
@@ -84,13 +86,11 @@ class OpenRouterModelCatalog @Inject constructor() {
                 }
 
                 if (selectedByProvider.isEmpty()) {
-                    return@withContext Result.success(SettingsStore.FALLBACK_MODELS)
+                    return@withContext Result.failure(IOException("No text models with tool support found"))
                 }
 
                 val selectedByProviderId = selectedByProvider.associateBy { providerFromId(it.id) }.toMutableMap()
-                SettingsStore.FALLBACK_MODELS.forEach { fallback ->
-                    selectedByProviderId.putIfAbsent(providerFromId(fallback.id), fallback)
-                }
+
 
                 val ordered = MAJOR_MANUFACTURERS.mapNotNull { manufacturer ->
                     selectedByProviderId[manufacturer.providerId]

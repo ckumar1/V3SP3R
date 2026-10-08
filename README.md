@@ -1,3 +1,5 @@
+> **Maintenance fork:** Reliability work and current verification limits are documented in [MAINTENANCE.md](MAINTENANCE.md). The upstream feature descriptions below are not hardware acceptance results.
+
 ```
  ██╗   ██╗ ██████╗ ███████╗██████╗ ███████╗██████╗
  ██║   ██║╚════██╗██╔════╝██╔══██╗██╔════╝██╔══██╗

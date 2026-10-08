@@ -2,6 +2,8 @@ package com.vesper.flipper.domain.executor
 
 import com.vesper.flipper.ble.FlipperFileSystem
 import com.vesper.flipper.data.SettingsStore
+import com.vesper.flipper.data.FlipperAppCatalog
+import com.vesper.flipper.data.installCatalogApp
 import com.vesper.flipper.domain.model.*
 import com.vesper.flipper.domain.service.AuditService
 import com.vesper.flipper.domain.service.DiffService
@@ -662,8 +664,8 @@ class CommandExecutor @Inject constructor(
         }
     }
 
-    private fun executeFapHubSearch(query: String): CommandResultData {
-        val matches = FapHubCatalog.searchApps(query)
+    private suspend fun executeFapHubSearch(query: String): CommandResultData {
+        val matches = FlipperAppCatalog().apps().filter { it.name.contains(query, true) || it.description.contains(query, true) || it.id.contains(query, true) }
         if (matches.isEmpty()) {
             return CommandResultData(
                 content = "No FapHub apps found for \"$query\".",
@@ -694,6 +696,13 @@ class CommandExecutor @Inject constructor(
         appIdOrName: String,
         directDownloadUrl: String?
     ): CommandResultData {
+        if (directDownloadUrl.isNullOrBlank() || directDownloadUrl.startsWith("https://lab.flipper.net/apps/")) {
+            val catalog = FlipperAppCatalog()
+            val apps = catalog.apps()
+            val app = apps.firstOrNull { it.id == appIdOrName || it.name.equals(appIdOrName, true) }
+                ?: throw IllegalArgumentException("Use an exact app ID returned by search_faphub")
+            return CommandResultData(message = installCatalogApp(fileSystem, catalog, app.id))
+        }
         val app = resolveCatalogFapApp(appIdOrName)
         if (app == null && directDownloadUrl.isNullOrBlank()) {
             throw IllegalArgumentException(
@@ -1115,6 +1124,9 @@ class CommandExecutor @Inject constructor(
             throw IOException("Downloaded file too large (${download.bytes.size} bytes, max ${MAX_FAP_BYTES})")
         }
 
+        if (looksLikeHtml(download.contentType, download.bytes)) {
+            throw IOException("This is a web page. Use the resource's raw file download URL.")
+        }
         val bytesWritten = fileSystem.writeFileBytes(destPath, download.bytes).getOrThrow()
         val fileName = destPath.substringAfterLast("/")
 

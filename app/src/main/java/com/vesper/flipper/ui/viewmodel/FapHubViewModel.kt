@@ -3,6 +3,8 @@ package com.vesper.flipper.ui.viewmodel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.vesper.flipper.ble.FlipperFileSystem
+import com.vesper.flipper.data.FlipperAppCatalog
+import com.vesper.flipper.data.installCatalogApp
 import com.vesper.flipper.domain.model.*
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Dispatchers
@@ -17,6 +19,10 @@ import javax.inject.Inject
 class FapHubViewModel @Inject constructor(
     private val flipperFileSystem: FlipperFileSystem
 ) : ViewModel() {
+
+    private val catalog = FlipperAppCatalog()
+    private val catalogApps = MutableStateFlow<List<FapApp>>(emptyList())
+    val inventoryLoaded = MutableStateFlow(false)
 
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
@@ -48,6 +54,7 @@ class FapHubViewModel @Inject constructor(
     private val _sortBy = MutableStateFlow(SortOption.DOWNLOADS)
     val sortBy: StateFlow<SortOption> = _sortBy.asStateFlow()
 
+    private val installedPaths = mutableMapOf<String, MutableList<String>>()
     private val _installedApps = MutableStateFlow<Set<String>>(emptySet())
     val installedApps: StateFlow<Set<String>> = _installedApps.asStateFlow()
 
@@ -64,12 +71,12 @@ class FapHubViewModel @Inject constructor(
     val selectedApp: StateFlow<FapApp?> = _selectedApp.asStateFlow()
 
     val displayedApps: StateFlow<List<FapApp>> = combine(
-        _searchQuery, _selectedCategory, _sortBy, _installedApps
-    ) { query, category, sort, installed ->
-        var apps = FapHubCatalog.allApps
+        _searchQuery, _selectedCategory, _sortBy, _installedApps, catalogApps
+    ) { query, category, sort, installed, available ->
+        var apps = available
         if (category != null) apps = apps.filter { it.category == category }
         if (query.isNotEmpty()) {
-            apps = FapHubCatalog.searchApps(query).let { results ->
+            apps = available.filter { it.name.contains(query, true) || it.description.contains(query, true) || it.id.contains(query, true) }.let { results ->
                 if (category != null) results.filter { it.category == category } else results
             }
         }
@@ -81,10 +88,10 @@ class FapHubViewModel @Inject constructor(
             SortOption.UPDATED -> apps.sortedByDescending { it.updatedAt }
             SortOption.CATEGORY -> apps.sortedBy { it.category.displayName }
         }
-    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), FapHubCatalog.allApps)
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    val categoryCounts: StateFlow<Map<FapCategory, Int>> = flow {
-        emit(FapCategory.entries.associateWith { FapHubCatalog.getAppsByCategory(it).size })
+    val categoryCounts: StateFlow<Map<FapCategory, Int>> = catalogApps.map { apps ->
+        FapCategory.entries.associateWith { category -> apps.count { it.category == category } }
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyMap())
 
     // ═══════════════════════════════════════════════════════
@@ -122,7 +129,14 @@ class FapHubViewModel @Inject constructor(
     // ═══════════════════════════════════════════════════════
 
     init {
-        loadInstalledApps()
+        refresh()
+    }
+
+    private fun loadCatalog() {
+        viewModelScope.launch {
+            try { catalogApps.value = catalog.apps() }
+            catch (e: Exception) { _error.value = "Catalog unavailable: ${e.message}" }
+        }
     }
 
     // Apps Tab Actions
@@ -141,115 +155,54 @@ class FapHubViewModel @Inject constructor(
         viewModelScope.launch {
             _isLoading.value = true
             try {
-                val rootResult = flipperFileSystem.listDirectory("/ext/apps")
-                if (rootResult.isSuccess) {
-                    val rootEntries = rootResult.getOrNull() ?: emptyList()
-                    val fapEntries = rootEntries.filter { !it.isDirectory && it.name.endsWith(".fap") }
-                    val dirEntries = rootEntries.filter { it.isDirectory }
-                    val nestedFaps = mutableListOf<String>()
-                    for (dir in dirEntries) {
-                        val nestedResult = flipperFileSystem.listDirectory(dir.path)
-                        if (nestedResult.isSuccess) {
-                            nestedFaps.addAll(nestedResult.getOrNull().orEmpty().filter { !it.isDirectory && it.name.endsWith(".fap") }.map { it.name })
+                val found = mutableSetOf<String>()
+                val paths = mutableMapOf<String, MutableList<String>>()
+                suspend fun scan(path: String, depth: Int) {
+                    if (depth > 8) return
+                    val entries = flipperFileSystem.listDirectory(path).getOrThrow()
+                    for (entry in entries) {
+                        if (entry.isDirectory) scan(entry.path, depth + 1)
+                        else if (entry.name.endsWith(".fap")) {
+                            val id = entry.name.removeSuffix(".fap")
+                            found += id
+                            paths.getOrPut(id) { mutableListOf() }.add(entry.path)
                         }
                     }
-                    _installedApps.value = (fapEntries.map { it.name } + nestedFaps).map { it.removeSuffix(".fap") }.toSet()
                 }
-            } catch (_: Exception) { }
+                scan("/ext/apps", 0)
+                installedPaths.clear()
+                installedPaths.putAll(paths)
+                _installedApps.value = found
+                inventoryLoaded.value = true
+            } catch (e: Exception) {
+                inventoryLoaded.value = false
+                _error.value = "Installed apps could not be read. Connect and unlock the Flipper, then refresh."
+            }
             finally { _isLoading.value = false }
         }
     }
 
     fun installApp(app: FapApp) {
         viewModelScope.launch {
-            _installStatus.value = _installStatus.value + (app.id to InstallStatus.Downloading(0f))
+            _installStatus.value = _installStatus.value + (app.id to InstallStatus.Installing)
             try {
-                // Resolve a direct .fap URL from the catalog download URL
-                val sourceUrl = app.downloadUrl
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Downloading(0.1f))
-
-                // Try to find a direct .fap binary. The catalog URLs point to
-                // lab.flipper.net pages, so we attempt to scrape for a .fap link.
-                // If the URL already ends in .fap, use it directly.
-                val binaryUrl = if (sourceUrl.endsWith(".fap", ignoreCase = true)) {
-                    sourceUrl
-                } else {
-                    resolveFapUrl(sourceUrl, app.id)
-                }
-
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Downloading(0.3f))
-
-                // Download the .fap binary
-                val bytes = withContext(Dispatchers.IO) {
-                    val request = Request.Builder()
-                        .url(binaryUrl)
-                        .header("User-Agent", "V3SP3R-FapHub/1.0")
-                        .header("Accept", "application/octet-stream,*/*")
-                        .build()
-                    httpClient.newCall(request).execute().use { response ->
-                        if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code}")
-                        response.body?.bytes() ?: throw java.io.IOException("Empty response")
-                    }
-                }
-
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Downloading(0.7f))
-
-                // Validate — reject HTML responses (means no direct download available)
-                val preview = bytes.take(48).toByteArray().toString(Charsets.UTF_8).trimStart().lowercase()
-                if (preview.startsWith("<!doctype") || preview.startsWith("<html") || preview.startsWith("<head")) {
-                    throw java.io.IOException("No direct .fap download available — use the Flipper companion app or qFlipper to install ${app.name}")
-                }
-                if (bytes.isEmpty()) throw java.io.IOException("Downloaded file is empty")
-
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Downloading(0.9f))
-
-                // Write to Flipper storage — works on any firmware (OFW, Momentum, Unleashed, Xtreme, RogueMaster)
-                // All firmwares use /ext/apps/{category}/ structure
-                val installDir = "/ext/apps/${app.category.name.lowercase()}"
-                flipperFileSystem.createDirectory(installDir) // ignore if exists
-                val targetPath = "$installDir/${app.id}.fap"
-
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Installing)
-                flipperFileSystem.writeFileBytes(targetPath, bytes).getOrThrow()
-
+                val result = installCatalogApp(flipperFileSystem, catalog, app.id)
                 _installStatus.value = _installStatus.value + (app.id to InstallStatus.Success)
-                _installedApps.value = _installedApps.value + app.id
-                kotlinx.coroutines.delay(2000)
-                _installStatus.value = _installStatus.value - app.id
+                _error.value = result
+                loadInstalledApps()
             } catch (e: Exception) {
-                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Error(e.message ?: "Unknown error"))
+                _installStatus.value = _installStatus.value + (app.id to InstallStatus.Error(e.message ?: "Install failed"))
                 _error.value = "Failed to install ${app.name}: ${e.message}"
             }
-        }
-    }
-
-    private suspend fun resolveFapUrl(pageUrl: String, appIdHint: String): String = withContext(Dispatchers.IO) {
-        val request = Request.Builder()
-            .url(pageUrl)
-            .header("User-Agent", "V3SP3R-FapHub/1.0")
-            .header("Accept", "text/html")
-            .build()
-        val html = httpClient.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw java.io.IOException("HTTP ${response.code} fetching $pageUrl")
-            response.body?.string() ?: throw java.io.IOException("Empty page")
-        }
-        // Find .fap URLs in the page
-        val fapRegex = Regex("""href=["']([^"']*\.fap[^"']*)["']""", RegexOption.IGNORE_CASE)
-        val candidates = fapRegex.findAll(html).map { it.groupValues[1] }.toList()
-        if (candidates.isEmpty()) {
-            // Fall back to using the original URL — download will likely fail with HTML check
-            pageUrl
-        } else {
-            candidates.firstOrNull { it.contains(appIdHint, ignoreCase = true) } ?: candidates.first()
         }
     }
 
     fun uninstallApp(app: FapApp) {
         viewModelScope.launch {
             try {
-                listOf("/ext/apps/${app.id}.fap", "/ext/apps/${app.category.name.lowercase()}/${app.id}.fap").forEach {
-                    flipperFileSystem.deleteFile(it)
-                }
+                val paths = installedPaths[app.id] ?: error("Refresh installed apps before uninstalling")
+                paths.forEach { flipperFileSystem.deleteFile(it).getOrThrow() }
+                installedPaths.remove(app.id)
                 _installedApps.value = _installedApps.value - app.id
             } catch (e: Exception) {
                 _error.value = "Failed to uninstall ${app.name}: ${e.message}"
@@ -257,7 +210,7 @@ class FapHubViewModel @Inject constructor(
         }
     }
 
-    fun refresh() { loadInstalledApps() }
+    fun refresh() { loadCatalog(); loadInstalledApps() }
 }
 
 enum class SortOption(val displayName: String) {
